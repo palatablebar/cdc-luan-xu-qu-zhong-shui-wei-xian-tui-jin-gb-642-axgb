@@ -60,12 +60,22 @@
     }, 650);
   }
 
+  function settleDate() {
+    var box = document.getElementById("settle-date");
+    return box ? box.value : "";
+  }
+
+  function reloadSoon() {
+    window.setTimeout(function () {
+      window.location.reload();
+    }, 650);
+  }
+
   document.addEventListener("click", function (event) {
     var target = event.target.closest("button");
     if (!target) return;
 
-    if (target.id === "btn-import" || target.id === "btn-rerun") {
-      var select = document.getElementById("source-select");
+    if (target.id === "btn-import" || target.id === "btn-rerun") {      var select = document.getElementById("source-select");
       var source = target.id === "btn-rerun" ? "all" : (select ? select.value : "all");
       busy(target, true);
       request("/api/events/import", { source: source })
@@ -104,6 +114,43 @@
           window.setTimeout(function () {
             window.location.reload();
           }, 650);
+        })
+        .catch(function (err) {
+          toast(err.message, true);
+          busy(target, false);
+        });
+      return;
+    }
+
+    if (target.id === "btn-settle-compute") {
+      busy(target, true);
+      request("/api/settlement/run", { settle_date: settleDate() })
+        .then(function (data) {
+          toast("已计算 " + data.run.run_id + " · 订单 " +
+            (data.preview ? data.preview.added + data.preview.changed : 0) +
+            " · 发布前请看影响面");
+          reloadSoon();
+        })
+        .catch(function (err) {
+          toast(err.message, true);
+          busy(target, false);
+        });
+      return;
+    }
+
+    if (target.id === "btn-settle-publish") {
+      var runId = target.getAttribute("data-run");
+      var digest = target.getAttribute("data-digest");
+      if (!runId || !digest) return;
+      busy(target, true);
+      request("/api/settlement/" + encodeURIComponent(runId) + "/publish",
+        { impact_digest: digest })
+        .then(function (data) {
+          var result = data.result || {};
+          toast(result.noop ? "与已发布版本一致，无需发布"
+            : "已发布 " + data.run.run_id + " · 影响 " +
+              (result.diff ? result.diff.changed : 0) + " 单");
+          reloadSoon();
         })
         .catch(function (err) {
           toast(err.message, true);

@@ -139,6 +139,30 @@ REASONS = {
     "X_EMPTY_SELECTION": _r(
         "X_EMPTY_SELECTION", WARN, "export",
         "导出选择为空", "先跑一次采信再导出"),
+    # ---- M8 佣金日结 ----
+    "T_TIER_ASOF_ORDER": _r(
+        "T_TIER_ASOF_ORDER", INFO, "settle",
+        "按订单发生时的会员等级计价", "等级迟到不追改已定订单，除非显式回溯"),
+    "T_TIER_DEFAULT": _r(
+        "T_TIER_DEFAULT", WARN, "settle",
+        "订单发生时尚无该客户的等级事件，按默认等级计价",
+        "回源补客户等级，或确认订单属于新客首单"),
+    "T_TIER_UNKNOWN": _r(
+        "T_TIER_UNKNOWN", ERROR, "settle",
+        "等级取值不在费率表中，该订单佣金无法计价", "先在费率表登记该等级"),
+    "C_TIER_CONFLICT": _r(
+        "C_TIER_CONFLICT", ERROR, "settle",
+        "同一客户同一时刻出现两种不同等级，按冲突隔离，不推进结账截止点",
+        "回源确认哪条等级变更有效"),
+    "S_SETTLE_RESTATED": _r(
+        "S_SETTLE_RESTATED", WARN, "settle",
+        "已发布订单被迟到修正改写，佣金发生变化", "核对影响面后重新发布并留痕"),
+    "B_SETTLE_PUBLISH_BLOCKED": _r(
+        "B_SETTLE_PUBLISH_BLOCKED", ERROR, "settle",
+        "存在未预览或未确认的影响面，拒绝发布，保留旧版", "先预览影响面再确认发布"),
+    "B_SETTLE_NOTHING_TO_PUBLISH": _r(
+        "B_SETTLE_NOTHING_TO_PUBLISH", WARN, "settle",
+        "本次计算与已发布版本一致，无需发布", "重复补数重跑不会重复累计"),
 }
 
 

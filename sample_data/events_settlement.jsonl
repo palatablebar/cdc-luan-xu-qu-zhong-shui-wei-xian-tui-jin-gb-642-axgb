@@ -1,0 +1,14 @@
+# cdc-export v2 rows=13 charset=utf-8 来源=佣金日结样例（顾客等级 + 订单）
+{"table":"customers","pk":"C01","version":1,"op":"upsert","event_time":"2026-11-15T09:00:00Z","schema":"v2","payload":{"status":"活跃","tier":"银卡"}}
+{"table":"customers","pk":"C01","version":2,"op":"upsert","event_time":"2026-11-15T18:00:00Z","schema":"v2","payload":{"status":"活跃","tier":"金卡"}}
+{"table":"customers","pk":"C02","version":1,"op":"upsert","event_time":"2026-11-15T10:00:00Z","schema":"v2","payload":{"status":"活跃","tier":"钻石"}}
+{"table":"customers","pk":"C02","version":2,"op":"upsert","event_time":"2026-11-17T03:00:00Z","schema":"v2","payload":{"status":"活跃","tier":"银卡"}}
+{"table":"customers","pk":"C03","version":1,"op":"upsert","event_time":"2026-11-16T09:30:00Z","schema":"v2","payload":{"status":"活跃","tier":"金卡"}}
+{"table":"orders","pk":"A100","version":1,"op":"upsert","event_time":"2026-11-16T10:00:00Z","schema":"v2","payload":{"status":"已支付","amount":"1000.00","customer":"C01"}}
+{"table":"orders","pk":"A101","version":1,"op":"upsert","event_time":"2026-11-16T11:00:00Z","schema":"v2","payload":{"status":"已支付","amount":"500.00","customer":"C02"}}
+{"table":"orders","pk":"A102","version":1,"op":"upsert","event_time":"2026-11-16T12:00:00Z","schema":"v2","payload":{"status":"已支付","amount":"200.00","customer":"C99"}}
+{"table":"orders","pk":"A103","version":1,"op":"upsert","event_time":"2026-11-16T14:00:00Z","schema":"v2","payload":{"status":"已支付","amount":"800.00","customer":"C03"}}
+{"table":"orders","pk":"A104","version":1,"op":"upsert","event_time":"2026-11-16T15:00:00Z","schema":"v2","payload":{"status":"已支付","amount":"400.00"}}
+{"table":"orders","pk":"A105","version":1,"op":"upsert","event_time":"2026-11-16T23:30:00Z","schema":"v2","payload":{"status":"已支付","amount":"300.00","customer":"C01"}}
+{"table":"orders","pk":"A106","version":1,"op":"upsert","event_time":"2026-11-17T00:30:00Z","schema":"v2","payload":{"status":"已支付","amount":"600.00","customer":"C01"}}
+{"table":"orders","pk":"A107","version":1,"op":"upsert","event_time":"2026-11-17T01:30:00Z","schema":"v2","payload":{"status":"已支付","amount":"1200.00","customer":"C02"}}

@@ -77,6 +77,10 @@ FIELDS = {
     "status": {"type": "string", "required": True, "label": "状态"},
     "amount": {"type": "decimal", "required": False, "label": "金额(元)"},
     "qty": {"type": "int", "required": False, "label": "数量"},
+    # 佣金日结用：orders 上的 customer 指向 customers 的主键；
+    # customers 上的 tier 是会员等级变更事件（只在该字段出现时才算一次等级变更）。
+    "customer": {"type": "string", "required": False, "label": "客户号"},
+    "tier": {"type": "string", "required": False, "label": "会员等级"},
 }
 
 # v1 旧列名 → 规范化列名；v2 也接受旧名（读兼容），重名同时出现即歧义
@@ -98,6 +102,7 @@ SOURCES = {
     "main": ("events_main.jsonl",),
     "v1_csv": ("events_v1_gb.csv",),
     "late": ("events_late.jsonl",),
+    "settlement": ("events_settlement.jsonl",),
 }
 SOURCE_ORDER = ("events_main.jsonl", "events_v1_gb.csv", "events_late.jsonl")
 SOURCE_LABELS = {
@@ -105,10 +110,31 @@ SOURCE_LABELS = {
     "main": "主文件 events_main.jsonl",
     "v1_csv": "旧列名 events_v1_gb.csv",
     "late": "迟到补丁 events_late.jsonl",
+    "settlement": "佣金日结样例 events_settlement.jsonl",
 }
 
 CSV_COLUMNS = ("table", "pk", "version", "op", "event_time", "schema",
                "ref_no", "amt", "st", "qt")
+
+# ---- 佣金日结（M8）----
+# 订单发生时的等级口径：一笔订单用「订单 event_time 当时有效」的会员等级计价，
+# 而不是结账时刻的最新等级。等级变更是一等事件（customers.tier），有自己的
+# event_time，可以比订单更晚到达；按时间而不是按到达顺序回溯。
+TIER_RATES = {
+    "普通": Decimal("0.01"),
+    "银卡": Decimal("0.03"),
+    "金卡": Decimal("0.05"),
+    "钻石": Decimal("0.08"),
+}
+TIER_DEFAULT = "普通"
+# 判定等级时比较的时间精度：秒（导出与展示都到秒，避免同一秒内的伪乱序）
+SETTLEMENT_TZ = "Asia/Shanghai"
+SETTLEMENT_CUTOFF = "09:00"          # 交班时间，本地时区
+SETTLEMENT_CURRENCY = "CNY"
+COMMISSION_DECIMAL = Decimal("0.01")
+
+# 已发布订单的迟到修正：影响面预览是发布的前置条件，不预览不能发布
+RESTATEMENT_PREVIEW_REQUIRED = True
 
 # 半开区间的书面表达，页面与导出共用同一句
 WINDOW_NOTE = "快照窗口含 as_of；待定窗口为 (as_of, +inf)"

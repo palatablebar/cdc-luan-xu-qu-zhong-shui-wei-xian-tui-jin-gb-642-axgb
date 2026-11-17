@@ -242,24 +242,31 @@ table.grid tr.is-dim td {
 
 .state-applied,
 .state-ok,
-.state-active {
+.state-active,
+.state-settled,
+.state-published {
   color: var(--ok);
 }
 
 .state-duplicate,
 .state-warn,
-.state-pending {
+.state-pending,
+.state-computed {
   color: var(--warn);
 }
 
 .state-conflict,
 .state-quarantine,
 .state-bad,
-.state-tombstone {
+.state-tombstone,
+.state-held,
+.state-failed {
   color: var(--bad);
 }
 
-.state-info {
+.state-info,
+.state-superseded,
+.state-noop {
   color: var(--info);
 }
 

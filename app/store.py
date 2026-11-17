@@ -15,6 +15,11 @@ from contextlib import contextmanager
 from decimal import Decimal
 from pathlib import Path
 
+
+def _now_iso() -> str:
+    import datetime as dt
+    return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS batches (
     batch_id TEXT PRIMARY KEY,
@@ -70,6 +75,57 @@ CREATE TABLE IF NOT EXISTS totals (
 );
 CREATE TABLE IF NOT EXISTS manifests (
     batch_id TEXT PRIMARY KEY, json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS settlement_runs (
+    run_id TEXT PRIMARY KEY,
+    settle_date TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    status TEXT NOT NULL,             -- computed / published / failed / superseded
+    computed_at TEXT NOT NULL,
+    published_at TEXT,
+    cutoff_utc TEXT NOT NULL,         -- 结账截止点 = 当日 09:00（本地时区）
+    data_horizon_utc TEXT,            -- 本次实际纳入的最大已应用 event_time
+    rule_version TEXT NOT NULL,
+    tier_policy TEXT NOT NULL,
+    input_digest TEXT NOT NULL,
+    asof_batch_id TEXT,               -- 本次计算读的 CDC 批次
+    supersedes TEXT,                  -- 被本版本替换的已发布 run_id
+    blocked_reason TEXT,
+    note TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_settle_date
+    ON settlement_runs(settle_date, status, revision);
+CREATE TABLE IF NOT EXISTS settlement_orders (
+    run_id TEXT NOT NULL,
+    settle_date TEXT NOT NULL,
+    order_pk TEXT NOT NULL,
+    customer_pk TEXT,
+    order_time_utc TEXT NOT NULL,
+    amount TEXT,
+    commission TEXT NOT NULL,
+    tier TEXT NOT NULL,
+    tier_source TEXT NOT NULL,        -- asof / default / unknown
+    tier_event_ref TEXT,
+    status TEXT NOT NULL,
+    reason_code TEXT,
+    row_ref TEXT,
+    late INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (run_id, settle_date, order_pk)
+);
+CREATE INDEX IF NOT EXISTS idx_settle_order_key
+    ON settlement_orders(settle_date, order_pk);
+CREATE TABLE IF NOT EXISTS settlement_anomalies (
+    run_id TEXT NOT NULL, seq INTEGER NOT NULL, settle_date TEXT NOT NULL,
+    kind TEXT NOT NULL,               -- tier_conflict / unknown_tier / missing_customer
+    key TEXT NOT NULL, reason_code TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '',
+    refs_json TEXT NOT NULL DEFAULT '[]'
+);
+CREATE TABLE IF NOT EXISTS settlement_diffs (
+    from_run_id TEXT NOT NULL, to_run_id TEXT NOT NULL, settle_date TEXT NOT NULL,
+    order_pk TEXT NOT NULL, change TEXT NOT NULL,   -- added / removed / changed
+    old_commission TEXT, new_commission TEXT,
+    old_tier TEXT, new_tier TEXT,
+    delta TEXT NOT NULL, row_ref TEXT
 );
 """
 
@@ -318,6 +374,182 @@ class Store:
             out[table] = self._all(
                 f"SELECT COUNT(*) AS n FROM {table} WHERE batch_id=?", (batch_id,))[0]["n"]
         return out
+
+    # ---------- 佣金日结（M8） ----------
+    def save_settlement(self, *, header: dict, orders: list[dict],
+                        anomalies: list[dict]) -> None:
+        """计算结果落库：同一 run_id 先删后插，单事务；不改任何已发布版本。"""
+        with self.connect() as conn:
+            conn.execute("DELETE FROM settlement_orders WHERE run_id=?", (header["run_id"],))
+            conn.execute("DELETE FROM settlement_anomalies WHERE run_id=?",
+                         (header["run_id"],))
+            conn.execute("DELETE FROM settlement_diffs WHERE from_run_id=? OR to_run_id=?",
+                         (header["run_id"], header["run_id"]))
+            conn.execute(
+                """INSERT INTO settlement_runs (run_id,settle_date,revision,status,
+                        computed_at,published_at,cutoff_utc,data_horizon_utc,
+                        rule_version,tier_policy,
+                        input_digest,asof_batch_id,supersedes,blocked_reason,note)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(run_id) DO UPDATE SET
+                     status=excluded.status, computed_at=excluded.computed_at,
+                     input_digest=excluded.input_digest,
+                     data_horizon_utc=excluded.data_horizon_utc,
+                     asof_batch_id=excluded.asof_batch_id,
+                     blocked_reason=excluded.blocked_reason, note=excluded.note""",
+                (header["run_id"], header["settle_date"], header["revision"],
+                 header["status"], header["computed_at"], header.get("published_at"),
+                 header["cutoff_utc"], header.get("data_horizon_utc"),
+                 header["rule_version"], header["tier_policy"],
+                 header["input_digest"], header.get("asof_batch_id"),
+                 header.get("supersedes"), header.get("blocked_reason", ""),
+                 header.get("note", "")))
+            for row in orders:
+                conn.execute(
+                    """INSERT INTO settlement_orders (run_id,settle_date,order_pk,
+                        customer_pk,order_time_utc,amount,commission,tier,tier_source,
+                        tier_event_ref,status,reason_code,row_ref,late)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (header["run_id"], header["settle_date"], row["order_pk"],
+                     row.get("customer_pk"), row["order_time_utc"],
+                     None if row.get("amount") is None else str(row["amount"]),
+                     str(row["commission"]), row["tier"], row["tier_source"],
+                     row.get("tier_event_ref"), row["status"], row.get("reason_code"),
+                     row.get("row_ref"), 1 if row.get("late") else 0))
+            for i, row in enumerate(anomalies, 1):
+                conn.execute(
+                    """INSERT INTO settlement_anomalies (run_id,seq,settle_date,kind,key,
+                        reason_code,detail,refs_json) VALUES (?,?,?,?,?,?,?,?)""",
+                    (header["run_id"], i, header["settle_date"], row["kind"],
+                     row["key"], row["reason_code"], row.get("detail", ""),
+                     json.dumps(row.get("refs", []), ensure_ascii=False)))
+
+    def settlement_run(self, run_id: str) -> dict | None:
+        rows = self._all("SELECT * FROM settlement_runs WHERE run_id=?", (run_id,))
+        return rows[0] if rows else None
+
+    def published_settlement(self, settle_date: str) -> dict | None:
+        rows = self._all(
+            "SELECT * FROM settlement_runs WHERE settle_date=? AND status='published' "
+            "ORDER BY revision DESC LIMIT 1", (settle_date,))
+        return rows[0] if rows else None
+
+    def latest_settlement(self, settle_date: str) -> dict | None:
+        """该日期 revision 最大的一次计算（不区分状态），用于列表与对比。"""
+        rows = self._all(
+            "SELECT * FROM settlement_runs WHERE settle_date=? "
+            "ORDER BY revision DESC LIMIT 1", (settle_date,))
+        return rows[0] if rows else None
+
+    def next_settlement_revision(self, settle_date: str) -> int:
+        n = self._all(
+            "SELECT COALESCE(MAX(revision), 0) AS n FROM settlement_runs WHERE settle_date=?",
+            (settle_date,))[0]["n"]
+        return int(n) + 1
+
+    def list_settlement_runs(self, settle_date: str | None = None,
+                             limit: int = 60) -> list[dict]:
+        if settle_date:
+            return self._all(
+                "SELECT * FROM settlement_runs WHERE settle_date=? "
+                "ORDER BY revision DESC LIMIT ?", (settle_date, limit))
+        return self._all(
+            "SELECT * FROM settlement_runs ORDER BY settle_date DESC, revision DESC "
+            "LIMIT ?", (limit,))
+
+    def settlement_dates(self, limit: int = 30) -> list[str]:
+        rows = self._all(
+            "SELECT DISTINCT settle_date FROM settlement_runs "
+            "ORDER BY settle_date DESC LIMIT ?", (limit,))
+        return [r["settle_date"] for r in rows]
+
+    def load_settlement_orders(self, run_id: str) -> list[dict]:
+        rows = self._all(
+            "SELECT * FROM settlement_orders WHERE run_id=? ORDER BY order_time_utc, order_pk",
+            (run_id,))
+        for r in rows:
+            r["amount"] = None if r["amount"] is None else Decimal(r["amount"])
+            r["commission"] = Decimal(r["commission"])
+            r["late"] = bool(r["late"])
+        return rows
+
+    def load_settlement_anomalies(self, run_id: str) -> list[dict]:
+        rows = self._all(
+            "SELECT * FROM settlement_anomalies WHERE run_id=? ORDER BY seq", (run_id,))
+        for r in rows:
+            r["refs"] = json.loads(r.pop("refs_json") or "[]")
+        return rows
+
+    def load_settlement_diffs(self, to_run_id: str) -> list[dict]:
+        rows = self._all(
+            "SELECT * FROM settlement_diffs WHERE to_run_id=? ORDER BY order_pk",
+            (to_run_id,))
+        for r in rows:
+            for key in ("old_commission", "new_commission", "delta"):
+                r[key] = None if r[key] is None else Decimal(r[key])
+        return rows
+
+    def publish_settlement(self, run_id: str, *, diff_rows: list[dict],
+                           note: str = "") -> dict:
+        """原子发布：新版本置 published、旧版本置 superseded、写影响面，同一事务。
+
+        任何一步失败整体回滚，旧的 published 版本与它的订单行原样保留；
+        重复发布同一 run_id 是幂等的，不会重复写影响面或重复累计佣金。
+        """
+        with self.connect() as conn:
+            target = conn.execute(
+                "SELECT * FROM settlement_runs WHERE run_id=?", (run_id,)).fetchone()
+            if target is None:
+                raise KeyError(f"结算运行 {run_id}")
+            if target["status"] == "published":
+                return {"run_id": run_id, "status": "published", "noop": True,
+                        "supersedes": target["supersedes"],
+                        "diff_rows": conn.execute(
+                            "SELECT COUNT(*) AS n FROM settlement_diffs WHERE to_run_id=?",
+                            (run_id,)).fetchone()["n"]}
+            previous = conn.execute(
+                "SELECT run_id FROM settlement_runs WHERE settle_date=? "
+                "AND status='published' ORDER BY revision DESC LIMIT 1",
+                (target["settle_date"],)).fetchone()
+            supersedes = previous["run_id"] if previous else None
+            conn.execute(
+                "UPDATE settlement_runs SET status='superseded' "
+                "WHERE settle_date=? AND status='published'", (target["settle_date"],))
+            conn.execute(
+                "DELETE FROM settlement_diffs WHERE to_run_id=?", (run_id,))
+            for row in diff_rows:
+                conn.execute(
+                    """INSERT INTO settlement_diffs (from_run_id,to_run_id,settle_date,
+                        order_pk,change,old_commission,new_commission,old_tier,new_tier,
+                        delta,row_ref) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                    (supersedes or "", run_id, target["settle_date"], row["order_pk"],
+                     row["change"],
+                     None if row.get("old_commission") is None
+                     else str(row["old_commission"]),
+                     None if row.get("new_commission") is None
+                     else str(row["new_commission"]),
+                     row.get("old_tier"), row.get("new_tier"),
+                     str(row["delta"]), row.get("row_ref")))
+            conn.execute(
+                "UPDATE settlement_runs SET status='published', published_at=?, "
+                "supersedes=?, blocked_reason='', note=? WHERE run_id=?",
+                (_now_iso(), supersedes, note, run_id))
+        return {"run_id": run_id, "status": "published", "noop": False,
+                "supersedes": supersedes, "diff_rows": len(diff_rows)}
+
+    def mark_settlement_failed(self, run_id: str, reason: str) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE settlement_runs SET status='failed', blocked_reason=? "
+                "WHERE run_id=? AND status!='published'", (reason, run_id))
+
+    def supersede_settlement(self, run_id: str) -> None:
+        """与已发布版本完全一致的重算：留档为 superseded，不改动对外版本。"""
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE settlement_runs SET status='superseded', note=? "
+                "WHERE run_id=? AND status!='published'",
+                ("与已发布版本一致，无需发布", run_id))
 
     def _all(self, sql: str, args: tuple) -> list[dict]:
         with self.connect() as conn:

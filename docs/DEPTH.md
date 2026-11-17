@@ -1,6 +1,6 @@
 # 深度登记 cdcwater（CDC 乱序去重与水位线推进）
 
-- 规模：中型（7 个功能模块 / 7 个页面 / 79 条测试）
+- 规模：中型（8 个功能模块 / 7 个页面 / 107 条测试）
 - 核心规则一：**版本序折叠 + 墓碑**——每个 `(table, pk)` 按 `version` 升序应用，`delete` 写墓碑；
   同键同版本出现两种内容整组不应用（`C_VERSION_CONFLICT`），删除之后到达的低版本 upsert
   不复活（`C_TOMBSTONE_RESURRECT`），删除之前到达的低版本照常应用后被覆盖。
@@ -22,6 +22,7 @@
 | M5 快照物化 | 按水位物化快照，看待定键与三条对账 | POST /api/snapshot、页面 /snapshot | `app/modules/m5_snapshot/apply.py` `app/modules/m5_snapshot/materialize.py` `app/modules/m5_snapshot/service.py` | `tests/test_m5_snapshot.py` |
 | M6 批次续跑 | 查历史、看运行清单、续跑与重跑 | GET /api/batches、POST /api/batches/{id}/resume、页面 /batches | `app/modules/m6_batches/state.py` `app/modules/m6_batches/resume.py` `app/modules/m6_batches/history.py` `app/modules/m6_batches/service.py` | `tests/test_m6_batches.py` |
 | M7 审计导出 | 下载证据行、隔离、冲突、快照与清单 | GET /api/export/* | `app/modules/m7_export/csv_out.py` `app/modules/m7_export/json_out.py` `app/modules/m7_export/manifest_out.py` `app/modules/m7_export/service.py` | `tests/test_m7_export.py` |
+| M8 佣金日结 | 按订单发生时等级算日结、看影响面、发布修正 | POST /api/settlement/compute、POST /api/settlement/{id}/publish、页面 /settlement | `app/modules/m8_settlement/policy.py` `app/modules/m8_settlement/ledger.py` `app/modules/m8_settlement/service.py` | `tests/test_m8_settlement.py` |
 
 端到端：`tests/test_e2e.py` 覆盖「样例 → 采信 → 归一 → 去重冲突 → 水位 → 快照 → 导出 → 页面」，
 含 4xx 失败输入与幂等重跑；`tests/test_invariants.py` 覆盖行账、键账、金额、幂等、迟到互补。
@@ -41,6 +42,10 @@
 | TRAP-19 | 一条事件同时像「重复」又像「冲突」，坏行还互相重复 | 按代码书写顺序覆盖，结果随遍历顺序变 | 优先级 `quarantine > conflict > duplicate > apply`，各桶由集合运算得出 | `app/modules/m3_dedup/service.py` | `tests/test_m3_dedup.py::test_conflict_beats_duplicate`、`tests/test_m3_dedup.py::test_priority_independent_of_input_order` |
 | TRAP-23 | 事件 `event_time` 恰好等于水位线 / 恰好等于 `as_of` | 两端都算，重复计入或漏计 | 迟到用半开 `[水位线, +inf)`；快照含 `as_of`、待定窗口 `(as_of, +inf)` 半开 | `app/modules/m4_watermark/watermark.py`、`app/modules/m5_snapshot/materialize.py` | `tests/test_m4_watermark.py::test_boundary_equal_watermark_is_not_late`、`tests/test_m5_snapshot.py::test_boundary_event_at_as_of_included_once` |
 | TRAP-26 | 拿上一轮旧导出再跑一次（最大事件 06:00 < 已持久化水位 08:52） | 无条件覆盖，水位回退、快照变旧 | 陈旧批次直接 409 `C_STALE_BATCH`，已落库结果不动 | `app/modules/m6_batches/resume.py`、`app/modules/m6_batches/state.py` | `tests/test_m6_batches.py::test_stale_input_rejected` |
+| TRAP-31 | 会员等级与订单变更乱序到达：10:00 的订单先到，18:00 的升级后到 | 按「当前/最新等级」计价，同一订单随等级漂移，台账与导出两套数字 | 一律按**订单发生时**等级计价；等级按时间回溯，不按到达顺序 | `app/modules/m8_settlement/policy.py` | `tests/test_m8_settlement.py::test_tier_is_as_of_order_not_current`、`::test_late_tier_change_rewrites_only_after_its_time` |
+| TRAP-32 | 某客户同一时刻出现两条不同等级的变更 | 任取一条（或最后写入），悄悄算错佣金 | 判 `C_TIER_CONFLICT`，该时刻及之后的订单挂起；更早订单不回溯改写；冲突事件不推进数据边界 | `app/modules/m8_settlement/ledger.py` | `tests/test_m8_settlement.py::test_tier_conflict_holds_orders_without_advancing_boundary`、`::test_earlier_orders_survive_later_tier_conflict` |
+| TRAP-33 | 同一补数文件被重跑，或多批导出各带同一订单 | 逐批累加，佣金重复计入 | 跨批次按规范化签名合并，同一天同 `input_digest` 复用 run，不新增订单行 | `app/modules/m8_settlement/ledger.py`、`app/modules/m8_settlement/service.py` | `tests/test_m8_settlement.py::test_repeated_backfill_is_idempotent`、`::test_merging_batches_does_not_double_count` |
+| TRAP-34 | 发布到一半失败，或没看影响面就发布 | 半套新账对外，旧账丢失，或迟到修正悄悄改写已发布订单 | 原子发布（同事务）；必须带影响面摘要才能发布，失败/未预览保留旧版 | `app/store.py`、`app/modules/m8_settlement/service.py` | `tests/test_m8_settlement.py::test_publish_failure_keeps_old_version`、`::test_publish_requires_preview_digest`、`::test_changed_order_reports_commission_delta` |
 
 ## 对账规则
 
@@ -53,27 +58,41 @@
 样例数据的四账：行 42 = 27 + 2 + 3 + 10；键 19 = 18 + 1；快照 18 = 16 活跃 + 2 墓碑；
 金额 1552.51 + 200.00 + 0.00 = 1752.51。
 
-## 反例与不变量
+**日结账（M8）**：每个结算日 佣金合计 = Σ 已结订单（金额 × 订单发生时等级费率），
+`held` 单不计入。16 日样例：4 单全结，佣金 132.00；17 日：3 单全结，佣金 141.00。
+等级事件按时间回溯，跨批次合并同签名事件，同 `input_digest` 重跑不新增行。
 
+## 反例与不变量
 - 反例（朴素实现会挂）：
   - `tests/test_m1_events.py::test_naive_utf8_decode_would_raise`（按声明编码直接解码抛
     `UnicodeDecodeError`，回退链不抛）；
   - `tests/test_m3_dedup.py::test_conflict_beats_duplicate`（顺序覆盖会把它判成 1 冲突 + 1 重复）；
   - `tests/test_m3_dedup.py::test_low_version_before_delete_still_applies`（把「删除前的低版本」
     一律当复活，会丢掉 1001 的 v1/v2，快照金额少 120.50）；
-  - `tests/test_m6_batches.py::test_stale_input_rejected`（后写覆盖会让水位从 08:52 退回 06:00）。
+  - `tests/test_m6_batches.py::test_stale_input_rejected`（后写覆盖会让水位从 08:52 退回 06:00）；
+  - `tests/test_m8_settlement.py::test_tier_is_as_of_order_not_current`（按当前等级会把 10:00
+    的 1000 元订单算成 50 元而不是 30 元，与台账不符）；
+  - `tests/test_m8_settlement.py::test_repeated_backfill_is_idempotent`（逐次累加会把同一补数
+    的佣金算两遍）。
 - 不变量：
   - `tests/test_invariants.py::test_row_accounting_identity`（行账守恒）；
   - `tests/test_invariants.py::test_key_accounting_identity`（键账守恒）；
   - `tests/test_invariants.py::test_amount_conservation_is_exact`（金额守恒，Decimal 精确）；
   - `tests/test_invariants.py::test_idempotent_rerun_keeps_rows_and_totals`（幂等重跑）；
   - `tests/test_m4_watermark.py::test_watermark_monotonic`（水位单调）；
-  - `tests/test_m5_snapshot.py::test_rebuild_is_idempotent`（物化可重复）。
+  - `tests/test_m5_snapshot.py::test_rebuild_is_idempotent`（物化可重复）；
+  - `tests/test_m8_settlement.py::test_publish_atomic_and_repeat_is_idempotent`（发布幂等）；
+  - `tests/test_m8_settlement.py::test_publish_failure_keeps_old_version`（失败保留旧版）；
+  - `tests/test_m8_settlement.py::test_recompute_after_publish_marks_superseded_without_changing_published`
+    （重算不改已发布）。
 
 ## 已知不覆盖
 
 - 只处理文件型导出，不接 Kafka / Debezium 在线流；水位线是「批内推进」，不是全局流进度。
 - 不做跨批次键级合并：每个批次独立折叠，快照只反映当前批次；跨批次的复活检测需要把历史
-  状态一起纳入，属于下一期。
+  状态一起纳入，属于下一期。（**例外**：佣金日结（M8）故意跨批次合并，因为它要的是
+  「当天所有已应用事件」的完整视图，见 DATA-DICTIONARY 第 10 节。）
 - 事务边界未建模：同一事务的多条变更不保证原子可见。
 - 中文数字、货币符号（`￥`）不在金额归一范围内，遇到直接按类型错误隔离。
+- 佣金日结的等级只认 `customers.tier` 事件；没有等级历史的客户按默认等级计价，
+  不反推历史等级，也不做等级生效期（起止时间）建模。

@@ -25,6 +25,7 @@ NAV = (
     ("/schema", "契约", "schema"),
     ("/conflicts", "冲突隔离", "conflicts"),
     ("/snapshot", "快照", "snapshot"),
+    ("/settlement", "佣金日结", "settlement"),
     ("/batches", "批次", "batches"),
 )
 

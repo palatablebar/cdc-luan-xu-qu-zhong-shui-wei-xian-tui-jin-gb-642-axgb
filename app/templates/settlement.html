@@ -1,0 +1,206 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="panel">
+  <div class="panel-head">
+    <h1>佣金日结</h1>
+    <p class="panel-sub">{{ settle_date }} · 交班 {{ cutoff }} · 口径 {{ policy.label }}</p>
+  </div>
+  <div class="panel-body">
+    <div class="actions">
+      <label class="field">
+        <span>结算日</span>
+        <select id="settle-date">
+          {% for day in dates %}
+          <option value="{{ day }}" {% if day == settle_date %}selected{% endif %}>{{ day }}</option>
+          {% endfor %}
+          {% if not dates %}<option value="{{ default_date }}" selected>{{ default_date }}</option>{% endif %}
+        </select>
+      </label>
+      <button class="btn btn-primary" id="btn-settle-compute" type="button">算一次</button>
+      {% if selected and selected.status != "published" %}
+      <button class="btn" id="btn-settle-publish" type="button"
+              data-run="{{ selected.run_id }}"
+              data-digest="{{ impact.digest if impact else '' }}"
+              {% if not impact %}disabled{% endif %}>按影响面发布</button>
+      {% endif %}
+      {% if selected %}
+      <a class="btn btn-ghost" href="/api/export/settlement.csv?run_id={{ selected.run_id }}">导出结算台账</a>
+      {% endif %}
+      {% if diffs %}
+      <a class="btn btn-ghost" href="/api/export/settlement-diff.csv?run_id={{ selected.run_id }}">导出影响面</a>
+      {% endif %}
+    </div>
+    <p class="hint">口径：{{ policy.note }}。{{ policy.commission }}。截止点 = 次日 {{ cutoff }}（本地时区），
+      冲突等级变更不推进截止点。重跑同一补数命中同一 digest，不重复累计。</p>
+  </div>
+</section>
+
+<div class="split">
+  <aside class="rail" aria-label="当日结算">
+    <dl>
+      <div class="row"><dt class="key">订单</dt><dd class="value">{{ counts.orders | num }}</dd></div>
+      <div class="row"><dt class="key">已结</dt><dd class="value is-ok">{{ counts.settled | num }}</dd></div>
+      <div class="row"><dt class="key">挂起</dt><dd class="value is-bad">{{ counts.held | num }}</dd></div>
+      <div class="row"><dt class="key">异常</dt><dd class="value is-warn">{{ counts.anomalies | num }}</dd></div>
+      {% if totals %}
+      <div class="row"><dt class="key">订单金额</dt><dd class="value">{{ totals.order_amount | dec }}</dd></div>
+      <div class="row"><dt class="key">佣金合计</dt><dd class="value is-ok">{{ totals.commission | dec }}</dd></div>
+      {% endif %}
+      {% if published_totals %}
+      <div class="row"><dt class="key">已发布佣金</dt><dd class="value">{{ published_totals.commission | dec }}</dd></div>
+      {% endif %}
+    </dl>
+  </aside>
+
+  <div class="stack">
+    <section class="panel">
+      <div class="panel-head">
+        <h2>发布状态</h2>
+        <p class="panel-sub">
+          {% if published %}已发布 {{ published.run_id }}{% else %}尚未发布{% endif %}
+        </p>
+      </div>
+      <div class="panel-body tight">
+        <div class="table-wrap">
+          <table class="grid">
+            <thead><tr><th>运行</th><th class="num">版本</th><th>状态</th><th>截止点</th><th>数据边界</th><th>计算</th><th>发布</th><th>摘要</th></tr></thead>
+            <tbody>
+              {% for row in runs %}
+              <tr class="{% if selected and row.run_id == selected.run_id %}{% else %}is-dim{% endif %}">
+                <td class="mono">{{ row.run_id }}</td>
+                <td class="num">{{ row.revision }}</td>
+                <td><span class="state state-{{ row.status }}">{{ row.status }}</span></td>
+                <td class="mono nowrap">{{ row.cutoff_utc | localdt }}</td>
+                <td class="mono nowrap">{{ row.data_horizon_utc | localdt }}</td>
+                <td class="mono nowrap">{{ row.computed_at | localdt }}</td>
+                <td class="mono nowrap">{{ row.published_at | localdt }}</td>
+                <td class="mono">{{ row.input_digest | short }}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+        {% if not runs %}<p class="empty">这一天还没有结算运行。</p>{% endif %}
+      </div>
+    </section>
+
+    {% if impact %}
+    <section class="panel">
+      <div class="panel-head">
+        <h2>影响面（发布前必看）</h2>
+        <p class="panel-sub">
+          {% if impact.from_run_id %}相对已发布 {{ impact.from_run_id }}{% else %}首次发布{% endif %}
+          · 增 {{ impact.added }} / 删 {{ impact.removed }} / 变 {{ impact.changed }}
+          · 佣金差 {{ impact.delta_total | dec }}
+        </p>
+      </div>
+      <div class="panel-body tight">
+        <p class="hint">确认摘要 <code class="code">{{ impact.digest }}</code>
+          发布时带同一摘要；若输入又变了，摘要不同会拒绝发布，旧版保持对外。</p>
+        <div class="table-wrap">
+          <table class="grid">
+            <thead><tr><th>订单号</th><th>变化</th><th class="num">原佣金</th><th class="num">新佣金</th><th>原等级</th><th>新等级</th><th class="num">差额</th></tr></thead>
+            <tbody>
+              {% for row in impact.rows %}
+              <tr>
+                <td class="mono">{{ row.order_pk }}</td>
+                <td>{{ row.change }}</td>
+                <td class="num">{{ row.old_commission | dec }}</td>
+                <td class="num">{{ row.new_commission | dec }}</td>
+                <td>{{ row.old_tier or '—' }}</td>
+                <td>{{ row.new_tier or '—' }}</td>
+                <td class="num">{{ row.delta | dec }}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+        {% if not impact.rows %}<p class="empty">与已发布版本一致，无影响。</p>{% endif %}
+      </div>
+    </section>
+    {% endif %}
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>订单结算行</h2>
+        <p class="panel-sub">{{ orders | length }} 行{% if selected %} · {{ selected.status }}{% endif %}</p>
+      </div>
+      <div class="panel-body tight">
+        <div class="table-wrap">
+          <table class="grid" data-sortable>
+            <thead><tr><th>订单号</th><th>客户</th><th>订单时间</th><th>等级</th><th>来源</th><th>等级依据</th><th class="num">金额(元)</th><th class="num">佣金(元)</th><th>状态</th><th>原因码</th><th>行号引用</th></tr></thead>
+            <tbody>
+              {% for row in orders %}
+              <tr>
+                <td class="mono">{{ row.order_pk }}</td>
+                <td class="mono">{{ row.customer_pk or '—' }}</td>
+                <td class="mono nowrap">{{ row.order_time | localdt }}</td>
+                <td>{{ row.tier or '—' }}</td>
+                <td class="mono">{{ row.tier_source }}</td>
+                <td class="mono ellipsis" title="{{ row.tier_event_ref }}">{{ row.tier_event_ref or '—' }}</td>
+                <td class="num">{{ row.amount | dec }}</td>
+                <td class="num">{{ row.commission | dec }}</td>
+                <td><span class="state state-{{ row.status }}">{{ row.status }}</span></td>
+                <td class="nowrap">{% if row.reason_code %}<code class="code is-{{ row.reason_code | level }}">{{ row.reason_code }}</code>{% else %}—{% endif %}</td>
+                <td class="mono nowrap">{{ row.row_ref or '—' }}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+        {% if not orders %}<p class="empty">这一天没有订单。</p>{% endif %}
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>等级异常（不参与计价 / 挂起）</h2>
+        <p class="panel-sub">{{ anomalies | length }} 条</p>
+      </div>
+      <div class="panel-body tight">
+        <div class="table-wrap">
+          <table class="grid">
+            <thead><tr><th>类别</th><th>键</th><th>原因码</th><th>明细</th><th>证据行</th></tr></thead>
+            <tbody>
+              {% for row in anomalies %}
+              <tr>
+                <td>{{ row.kind }}</td>
+                <td class="mono">{{ row.key }}</td>
+                <td><code class="code is-{{ row.reason_code | level }}">{{ row.reason_code }}</code></td>
+                <td class="ellipsis" title="{{ row.detail }}">{{ row.detail }}</td>
+                <td class="mono ellipsis" title="{{ row.refs | join(', ') }}">{{ row.refs | join(', ') }}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+        {% if not anomalies %}<p class="empty">没有等级异常。</p>{% endif %}
+      </div>
+    </section>
+  </div>
+</div>
+
+<section class="panel">
+  <div class="panel-head">
+    <h2>口径</h2>
+    <p class="panel-sub">{{ policy.tier_policy }}</p>
+  </div>
+  <div class="panel-body tight">
+    <div class="table-wrap">
+      <table class="grid">
+        <thead><tr><th>项</th><th>值</th></tr></thead>
+        <tbody>
+          <tr><td>计价等级</td><td>{{ policy.label }}</td></tr>
+          <tr><td>未采用</td><td>{{ policy.alternative }}</td></tr>
+          <tr><td>同一时刻多条</td><td>{{ policy.ties }}</td></tr>
+          <tr><td>佣金</td><td>{{ policy.commission }}</td></tr>
+          <tr><td>默认等级</td><td>{{ policy.default_tier }}</td></tr>
+          {% for tier in policy.tiers %}
+          <tr class="is-dim"><td>费率 · {{ tier.tier }}</td><td class="mono">{{ tier.rate }}</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+{% endblock %}

@@ -15,6 +15,9 @@
   `C_TOMBSTONE_RESURRECT`，两条都不应用；
 - 水位线 = 已应用事件最大 `event_time` − 10 分钟，严格小于才记迟到，迟到**仍然应用**；
 - 快照按 `event_time ≤ as_of` 物化，`as_of` 之后的事件留待定窗口，一并给出合计；
+- **佣金日结**：按**订单发生时的会员等级**计价（不是结账时的最新等级），等级事件按时间
+  回溯、不按到达顺序；同一补数重跑幂等不重复累计；发布原子，失败保留旧版，改写已发布
+  订单必须带影响面（哪些订单、佣金差多少）；
 - 批次键 = 输入摘要 + 规则版本 + 参数，同一输入重跑命中批次、不新增行；
 - 导出事件证据、隔离区、冲突表、快照 CSV/JSON 与运行清单（含 `run_id` 与每个输入的 sha256）。
 
@@ -29,6 +32,7 @@
 | M5 快照物化 | 按水位物化快照，看待定键 | `POST /api/snapshot`、页面 `/snapshot` | `apply.py` `materialize.py` |
 | M6 批次续跑 | 查历史、看清单、续跑与重跑 | `GET /api/batches`、页面 `/batches` | `state.py` `resume.py` `history.py` |
 | M7 审计导出 | 下载证据行、隔离、冲突、快照与清单 | `GET /api/export/*` | `csv_out.py` `json_out.py` `manifest_out.py` |
+| M8 佣金日结 | 按订单发生时等级算日结、看影响面、发布/修正 | `POST /api/settlement/compute`、`POST /api/settlement/{id}/publish`、页面 `/settlement` | `policy.py` `ledger.py` `service.py` |
 
 模块内统一是 `handler.py`（入口）+ `service.py`（编排）+ 两个纯规则/读写文件；
 定义写在 `docs/DATA-DICTIONARY.md`，坑与测试映射写在 `docs/DEPTH.md`。
@@ -39,7 +43,9 @@
 2. **冲突不猜**：同键同版本两种内容 → 整组不应用；删除后到达的低版本 upsert 不复活；
 3. **水位单调**：`max(event_time) − 10min`，只由已应用事件推进，迟到只标记不丢弃；
 4. **快照半开**：`[-, as_of]` 进快照、`(as_of, +inf)` 待定，两窗口不重叠；
-5. **金额 Decimal**：`0.01` 量化、`ROUND_HALF_UP`，合计可独立复算。
+5. **金额 Decimal**：`0.01` 量化、`ROUND_HALF_UP`，合计可独立复算；
+6. **日结按发生时等级**：佣金 = 金额 × **订单 `event_time` 当时**的等级费率；等级按时间回溯，
+   迟到的等级变更只改写它之后的订单；冲突变更不推进截止点，同一补数重跑不重复累计。
 
 ## 启动
 
@@ -58,14 +64,15 @@ docker compose down -v             # 连数据库卷一起删
 2. `/events` 按分类筛选，看每行的行号引用与原因码；
 3. `/conflicts` 看冲突分组、隔离区与优先级表，导出隔离 CSV；
 4. `/snapshot` 点「物化」，看活跃 / 墓碑 / 待定与三条对账；
-5. `/batches` 看 `run_id`、输入 sha256、阶段耗时，导出运行清单。
+5. `/settlement` 选结算日「算一次」，看影响面（哪些订单、佣金差多少）后「按影响面发布」；
+6. `/batches` 看 `run_id`、输入 sha256、阶段耗时，导出运行清单。
 
 ## API 与页面
 
 | 方法 | 路径 | 作用 |
 |---|---|---|
 | GET | `/api/health` | 健康检查与水位数 |
-| POST | `/api/events/import` | 采信（`source=all/main/v1_csv/late`） |
+| POST | `/api/events/import` | 采信（`source=all/main/v1_csv/late/settlement`） |
 | GET | `/api/events` | 事件流（可按分类、表过滤） |
 | GET | `/api/schema` | 契约、别名、版本 |
 | POST | `/api/schema/preview` | 单条试归一 |
@@ -76,19 +83,22 @@ docker compose down -v             # 连数据库卷一起删
 | POST | `/api/batches/{id}/resume` | 续跑 |
 | GET | `/api/export/{events,quarantine,conflicts,snapshot}.csv` | 证据导出 |
 | GET | `/api/export/{snapshot,manifest}.json` | 快照与运行清单 |
+| GET | `/api/settlement`、`/api/settlement/{id}`、`/api/settlement/{id}/impact` | 日结运行、明细、影响面 |
+| POST | `/api/settlement/compute`、`/api/settlement/{id}/publish` | 算日结（含预览）/ 按摘要发布 |
+| GET | `/api/export/{settlement,settlement-diff}.csv` | 结算台账与影响面导出 |
 
-页面共 6 个：`/`、`/events`、`/schema`、`/conflicts`、`/snapshot`、`/batches`。
+页面共 8 个：`/`、`/events`、`/schema`、`/conflicts`、`/snapshot`、`/settlement`、`/batches`（+ 导航）。
 
 ## 目录
 
 ```text
 app/
   main.py config.py errors.py reasons.py manifest.py store.py web.py bootstrap.py
-  modules/m1_events/ … m7_export/        # 每模块 handler + service + 2 个规则文件
+  modules/m1_events/ … m8_settlement/    # 每模块 handler + service + 规则文件
   templates/                             # base + 6 页
   static/                                # theme / layout / components + 3 个 js
 docs/  DEPTH.md  DATA-DICTIONARY.md  RUNBOOK.md
-sample_data/  events_main.jsonl  events_v1_gb.csv  events_late.jsonl  events_clean.jsonl  schema_contract.json
+sample_data/  events_main.jsonl  events_v1_gb.csv  events_late.jsonl  events_clean.jsonl  events_settlement.jsonl  schema_contract.json
 tests/  test_m1_events.py … test_m7_export.py  test_e2e.py  test_invariants.py  fixtures/
 ```
 
@@ -96,5 +106,7 @@ tests/  test_m1_events.py … test_m7_export.py  test_e2e.py  test_invariants.py
 
 - 只处理文件型导出，不连接 Kafka / Debezium 这类在线流；
 - schema 演进只覆盖列改名与新增字段，不支持类型收窄；
-- 同一批次内不做跨批次键级合并（每个批次独立折叠，快照只反映当前批次）；
-- 事件级事务边界（同一事务的多个变更原子可见）未建模。
+- 同一批次内不做跨批次键级合并（每个批次独立折叠，快照只反映当前批次）；佣金日结例外，
+  它按签名跨批次合并，取当天完整视图；
+- 事件级事务边界（同一事务的多个变更原子可见）未建模；
+- 日结等级只认 `customers.tier` 事件，不建模等级生效期；无等级历史的客户按默认等级计价。
